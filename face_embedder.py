@@ -1,0 +1,199 @@
+"""
+Flexible Face Embedding Pipeline using InsightFace (ArcFace) or custom ONNX models.
+
+Two modes:
+  1. Raw images   → detect → align → embed  (auto mode)
+  2. Cropped faces → embed directly           (cropped mode)
+
+Install:
+    pip install insightface onnxruntime numpy opencv-python
+"""
+
+import cv2
+import numpy as np
+from insightface.app import FaceAnalysis
+from insightface.model_zoo import get_model
+import os
+
+
+class FaceEmbedder:
+    """
+    Flexible face embedding extractor.
+
+    - For raw/uncropped images: detects faces, aligns, then extracts embeddings.
+    - For pre-cropped face images: directly extracts embeddings (skips detection).
+    - Supports loading a custom recognition model in ONNX format.
+    """
+
+    def __init__(self, model_name="buffalo_l", providers=None, det_size=(640, 640), custom_rec_onnx=None):
+        """
+        Args:
+            model_name: InsightFace model pack name (default: buffalo_l).
+            providers: ONNX Runtime providers. None = auto-detect (CUDA → CPU fallback).
+            det_size: Detection input size (only used in auto mode).
+            custom_rec_onnx: Path to a custom recognition ONNX model. If provided, replaces InsightFace's recognition model.
+        """
+        if providers is None:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        # Full pipeline (detection + recognition) for raw images
+        self.app = FaceAnalysis(name=model_name, providers=providers)
+        self.app.prepare(ctx_id=0, det_size=det_size)
+
+        # Extract the recognition model for direct embedding on cropped faces
+        self.rec_model = self.app.models.get("recognition")
+
+        self.custom_rec_onnx = custom_rec_onnx
+        if self.custom_rec_onnx is not None:
+            import onnxruntime as ort
+            self.custom_sess = ort.InferenceSession(self.custom_rec_onnx, providers=providers)
+            print(f"FaceEmbedder: Loaded custom recognition model from {self.custom_rec_onnx}")
+        else:
+            if self.rec_model is None:
+                raise RuntimeError("Could not find recognition model in the model pack.")
+            print(f"FaceEmbedder ready | Recognition model: {type(self.rec_model).__name__}")
+
+    # -------------------------------------------------------------------------
+    # Core methods
+    # -------------------------------------------------------------------------
+
+    def align_face(self, img: np.ndarray, kps: np.ndarray) -> np.ndarray:
+        """Align face using 5-point landmarks to standard 112x112 size."""
+        dst_pts = np.array([
+            [38.2946, 51.6963],
+            [73.5318, 51.5014],
+            [56.0252, 71.7366],
+            [41.5493, 92.3655],
+            [70.7299, 92.2041],
+        ], dtype=np.float32)
+        M, _ = cv2.estimateAffinePartial2D(kps, dst_pts, method=cv2.LMEDS)
+        if M is None:
+            return cv2.resize(img, (112, 112))
+        aligned = cv2.warpAffine(img, M, (112, 112), flags=cv2.INTER_LINEAR)
+        return aligned
+
+    def embed_raw(self, img: np.ndarray, max_faces: int = 1) -> list[dict]:
+        """
+        Full pipeline: detect → align → embed.
+        Use for raw/uncropped images that may contain multiple faces.
+
+        Args:
+            img: BGR image (as read by cv2.imread).
+            max_faces: Max number of faces to return (sorted by size, largest first).
+
+        Returns:
+            List of dicts: [{"embedding": np.array, "bbox": [x1,y1,x2,y2], "score": float}, ...]
+        """
+        faces = self.app.get(img)
+        if not faces:
+            return []
+
+        # Sort by face area (largest first)
+        faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+
+        results = []
+        for face in faces[:max_faces]:
+            if self.custom_rec_onnx is not None:
+                # Custom ONNX alignment & embedding
+                aligned_crop = self.align_face(img, face.kps)
+                embedding = self.embed_cropped(aligned_crop)
+            else:
+                embedding = face.embedding
+
+            results.append({
+                "embedding": embedding,
+                "bbox": face.bbox.tolist(),
+                "score": float(face.det_score),
+            })
+        return results
+
+    def embed_cropped(self, face_img: np.ndarray) -> np.ndarray:
+        """
+        Direct embedding: skip detection, assume input is already a cropped & aligned face.
+
+        Args:
+            face_img: BGR image of a cropped face. Will be resized to 112x112 internally.
+
+        Returns:
+            512-d embedding vector (np.ndarray), L2-normalized.
+        """
+        if self.custom_rec_onnx is not None:
+            # Preprocess BGR crop: resize, convert to RGB, normalize to [-1, 1], transpose to CHW
+            face_resized = cv2.resize(face_img, (112, 112))
+            face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+            face_float = face_rgb.astype(np.float32)
+            face_norm = (face_float - 127.5) / 127.5
+            face_input = np.transpose(face_norm, (2, 0, 1))
+            face_batch = np.expand_dims(face_input, axis=0) # shape (1, 3, 112, 112)
+
+            # Run inference
+            outputs = self.custom_sess.run(None, {'data': face_batch})
+            embedding = outputs[0].flatten()
+        else:
+            # Resize to model's expected input
+            face_resized = cv2.resize(face_img, self.rec_model.input_size)
+            # get_feat expects a list of HWC images — it handles preprocessing internally
+            embedding = self.rec_model.get_feat([face_resized]).flatten()
+
+        # L2 normalize
+        embedding = embedding / (np.linalg.norm(embedding) + 1e-10)
+        return embedding
+
+    # -------------------------------------------------------------------------
+    # Convenience methods
+    # -------------------------------------------------------------------------
+
+    def embed_file(self, img_path: str, is_cropped: bool = False, max_faces: int = 1):
+        """
+        Load image from file and extract embedding(s).
+
+        Args:
+            img_path: Path to the image file.
+            is_cropped: If True, treat as pre-cropped face (skip detection).
+            max_faces: Max faces to return (only for is_cropped=False).
+
+        Returns:
+            - If is_cropped=True: 512-d embedding (np.ndarray).
+            - If is_cropped=False: list of dicts with embedding, bbox, score.
+        """
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Cannot read image: {img_path}")
+
+        if is_cropped:
+            return self.embed_cropped(img)
+        else:
+            return self.embed_raw(img, max_faces=max_faces)
+
+    def embed_batch(self, img_paths: list[str], is_cropped: bool = False) -> np.ndarray:
+        """
+        Extract embeddings for a batch of images.
+
+        Args:
+            img_paths: List of image file paths.
+            is_cropped: If True, treat all images as pre-cropped faces.
+
+        Returns:
+            np.ndarray of shape (N, 512) — one embedding per image.
+            For raw images, only the largest face per image is used.
+        """
+        embeddings = []
+        for path in img_paths:
+            try:
+                if is_cropped:
+                    emb = self.embed_file(path, is_cropped=True)
+                else:
+                    results = self.embed_file(path, is_cropped=False, max_faces=1)
+                    if not results:
+                        print(f"  Warning: No face detected in {path}, skipping.")
+                        continue
+                    emb = results[0]["embedding"]
+                embeddings.append(emb)
+            except Exception as e:
+                print(f"  Error processing {path}: {e}")
+        return np.array(embeddings)
+
+    @staticmethod
+    def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
+        """Cosine similarity between two embeddings."""
+        return float(np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2)))

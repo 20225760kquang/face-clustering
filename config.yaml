@@ -1,0 +1,76 @@
+# =====================================================================
+# Face Clustering Benchmark Configuration
+# =====================================================================
+
+# Dataset configuration
+dataset:
+  # Path to the dataset directory containing person folders (e.g. PERSON_1, PERSON_2, etc.)
+  # Can be a relative path (from benchmark directory) or absolute path.
+  dir: "dataset/test_set"
+  
+  # Gallery/Query split parameters
+  gallery_count: 5      # First N images per person go to gallery
+  min_gallery: 2        # Minimum gallery count if a person has <= gallery_count images
+ 
+# Embedding extraction configuration
+extraction:
+  # Output folder for extracted embeddings and speed metrics (relative to project root)
+  output_dir: "benchmark/embeddings"
+  
+  # InsightFace model pack: buffalo_l, buffalo_m, buffalo_sc
+  model_name: "buffalo_l"
+  
+  # Target detection input size [width, height] for the face detector
+  det_size: [640, 640]
+  
+  # ONNX Runtime execution providers (first supported will be loaded)
+  providers:
+    - "CUDAExecutionProvider"
+    - "CPUExecutionProvider"
+    
+  # Mode of embedding extraction:
+  # 'raw'     = detect + landmark align + embed (full pipeline)
+  # 'cropped' = resize + embed directly          (skip detection)
+  mode: "raw"
+  
+  # Padding ratio (e.g. 0.4 = 40%) added around tight face crops so detector can find landmarks
+  pad_ratio: 0.4
+
+# Clustering algorithms hyperparameter search grids
+clustering:
+  # Output directory for results, reports, and visualization plots (relative to project root)
+  output_dir: "benchmark/results"
+  
+  # Define hyperparameter grid search options for each algorithm.
+  # Enable/disable algorithms by setting enabled: true/false.
+  algorithms:
+    dbscan:
+      enabled: true
+      eps: [0.3, 0.4, 0.5, 0.6]
+      min_samples: [1, 2, 3]
+      metric: ["cosine", "euclidean"]
+      
+    hdbscan:
+      enabled: true
+      min_cluster_size: [2, 3, 5]
+      min_samples: [1, 2]
+      cluster_selection_epsilon: [0.0, 0.1, 0.2]
+      metric: ["euclidean"]  # Note: scikit-learn HDBSCAN metric support varies, euclidean is universal
+      
+    kmeans:
+      enabled: true
+      # "n_persons" is a special value that will be dynamically replaced
+      # with the true number of unique identities/classes in the dataset.
+      n_clusters: ["n_persons"]
+      
+    agglomerative:
+      enabled: true
+      # When distance_threshold is used, n_clusters must be [null]
+      n_clusters: [null]
+      distance_threshold: [0.4, 0.5, 0.6, 0.7]
+      linkage: ["average", "complete", "single"]
+      metric: ["cosine", "euclidean"]
+
+# Visualization and plotting options
+evaluation:
+  tsne_perplexity: 30
