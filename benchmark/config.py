@@ -21,10 +21,11 @@ def load_config():
     # Use argparse.ArgumentParser(add_help=False) to avoid conflict when imported/used elsewhere
     # or just parse known args
     parser.add_argument("--dataset_dir", type=str, help="Path to dataset directory (containing pool/ and ground_truth.csv)")
-    parser.add_argument("--model_name", type=str, choices=["buffalo_l", "buffalo_m", "buffalo_sc", "finetuned"], help="InsightFace model pack or 'finetuned'")
+    parser.add_argument("--model_name", type=str, choices=["buffalo_l", "buffalo_m", "buffalo_sc", "finetuned", "adaface"], help="InsightFace model pack, 'finetuned', or 'adaface'")
     parser.add_argument("--mode", type=str, choices=["raw", "cropped"], help="Extraction mode ('raw' or 'cropped')")
     parser.add_argument("--output_dir", type=str, help="Output directory for embeddings")
     parser.add_argument("--results_dir", type=str, help="Output directory for results/reports")
+    parser.add_argument("--limit_persons", type=int, default=None, help="Limit number of persons to process for quick testing")
     
     # parse_known_args prevents crash when running other scripts that have their own args
     args, _ = parser.parse_known_args()
@@ -40,6 +41,10 @@ def load_config():
         config["extraction"]["output_dir"] = args.output_dir
     if args.results_dir:
         config["clustering"]["output_dir"] = args.results_dir
+    if args.limit_persons:
+        config["extraction"]["limit_persons"] = args.limit_persons
+    else:
+        config["extraction"]["limit_persons"] = None
         
     # --- Resolve Paths to absolute paths ---
     dataset_path = Path(config["dataset"]["dir"])
@@ -65,6 +70,13 @@ def load_config():
         config["extraction"]["custom_rec_onnx"] = str((SCRIPT_DIR.parent / "model" / "best_model.onnx").resolve())
     else:
         config["extraction"]["custom_rec_onnx"] = None
+
+    # Handle AdaFace path resolution
+    adaface_ckpt = config["extraction"].get("adaface_ckpt", "model/adaface_ir50_ms1mv2.ckpt")
+    adaface_ckpt_path = Path(adaface_ckpt)
+    if not adaface_ckpt_path.is_absolute():
+        adaface_ckpt_path = (PROJECT_ROOT / adaface_ckpt_path).resolve()
+    config["extraction"]["adaface_ckpt_path"] = str(adaface_ckpt_path)
 
     config["extraction"]["embeddings_file"] = emb_out_path / f"{model_name}_{mode}_embeddings.npz"
     config["extraction"]["speed_file"] = emb_out_path / f"{model_name}_{mode}_speed.npz"

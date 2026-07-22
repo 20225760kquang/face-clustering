@@ -18,6 +18,7 @@ extraction:
   output_dir: "benchmark/embeddings"
   
   # InsightFace model pack: buffalo_l, buffalo_m, buffalo_sc
+  # AdaFace base model (only used if model_name is 'adaface'): adaface_ir50, adaface_ir101, adaface_ir152
   model_name: "buffalo_l"
   
   # Target detection input size [width, height] for the face detector
@@ -35,6 +36,10 @@ extraction:
   
   # Padding ratio (e.g. 0.4 = 40%) added around tight face crops so detector can find landmarks
   pad_ratio: 0.4
+
+  # AdaFace configuration (only used if model_name is 'adaface')
+  adaface_arch: "ir_50"
+  adaface_ckpt: "model/adaface_ir50_ms1mv2.ckpt"
 
 # Clustering algorithms hyperparameter search grids
 clustering:

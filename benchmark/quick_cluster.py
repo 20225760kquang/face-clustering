@@ -4,7 +4,8 @@ Quick Cluster Evaluator for HDBSCAN and K-Means.
 Designed for fast testing on extracted embeddings without running a lengthy multi-algorithm grid search.
 
 Usage:
-    python benchmark/quick_cluster.py --model_name buffalo_l --mode raw
+    python benchmark/quick_cluster.py --model_name buffalo_l --mode raw (default = MiniBatchKMeans)
+    python benchmark/quick_cluster.py --model_name buffalo_l --mode raw --full_kmeans (force standard KMeans)
     python benchmark/quick_cluster.py --model_name finetuned --mode raw --algorithms kmeans hdbscan
 """
 
@@ -74,7 +75,7 @@ def evaluate_cluster_labels(algo_name, param_str, true_labels, pred_labels, elap
 
 def main():
     parser = argparse.ArgumentParser(description="Quick HDBSCAN & K-Means Cluster Evaluator")
-    parser.add_argument("--model_name", type=str, default="buffalo_l", choices=["buffalo_l", "buffalo_m", "buffalo_sc", "finetuned"])
+    parser.add_argument("--model_name", type=str, default="buffalo_l", choices=["buffalo_l", "buffalo_m", "buffalo_sc", "finetuned", "adaface"])
     parser.add_argument("--mode", type=str, default="raw", choices=["raw", "cropped"])
     parser.add_argument("--algorithms", nargs="+", default=["kmeans", "hdbscan"], choices=["kmeans", "hdbscan"])
     parser.add_argument("--min_cluster_size", type=int, default=3, help="HDBSCAN min_cluster_size")

@@ -25,33 +25,73 @@ class FaceEmbedder:
     - Supports loading a custom recognition model in ONNX format.
     """
 
-    def __init__(self, model_name="buffalo_l", providers=None, det_size=(640, 640), custom_rec_onnx=None):
+    def __init__(self, model_name="buffalo_l", providers=None, det_size=(640, 640), custom_rec_onnx=None,
+                 adaface_arch=None, adaface_ckpt_path=None):
         """
         Args:
-            model_name: InsightFace model pack name (default: buffalo_l).
+            model_name: InsightFace model pack name (default: buffalo_l), or 'adaface'.
             providers: ONNX Runtime providers. None = auto-detect (CUDA → CPU fallback).
             det_size: Detection input size (only used in auto mode).
             custom_rec_onnx: Path to a custom recognition ONNX model. If provided, replaces InsightFace's recognition model.
+            adaface_arch: Backbone architecture for AdaFace (e.g. 'ir_50').
+            adaface_ckpt_path: Path to AdaFace PyTorch checkpoint file (.ckpt).
         """
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
-        # Full pipeline (detection + recognition) for raw images
-        self.app = FaceAnalysis(name=model_name, providers=providers)
-        self.app.prepare(ctx_id=0, det_size=det_size)
-
-        # Extract the recognition model for direct embedding on cropped faces
-        self.rec_model = self.app.models.get("recognition")
-
+        self.adaface_model = None
         self.custom_rec_onnx = custom_rec_onnx
-        if self.custom_rec_onnx is not None:
-            import onnxruntime as ort
-            self.custom_sess = ort.InferenceSession(self.custom_rec_onnx, providers=providers)
-            print(f"FaceEmbedder: Loaded custom recognition model from {self.custom_rec_onnx}")
+
+        if model_name == "adaface":
+            # For face detection and keypoints in raw mode, we use buffalo_l
+            # to detect faces and extract keypoints, then align.
+            self.app = FaceAnalysis(name="buffalo_l", providers=providers)
+            self.app.prepare(ctx_id=0, det_size=det_size)
+            self.rec_model = None
+
+            # Load PyTorch model
+            import torch
+            import sys
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            adaface_dir = os.path.join(current_dir, "adaface")
+            if adaface_dir not in sys.path:
+                sys.path.insert(0, adaface_dir)
+            import net
+
+            # Build PyTorch model
+            self.adaface_arch = adaface_arch or "ir_50"
+            self.adaface_model = net.build_model(self.adaface_arch)
+
+            # Detect device
+            use_cuda = torch.cuda.is_available() and any("CUDA" in p for p in providers)
+            self.device = torch.device("cuda" if use_cuda else "cpu")
+
+            # Load weights
+            if not adaface_ckpt_path or not os.path.exists(adaface_ckpt_path):
+                raise FileNotFoundError(f"AdaFace checkpoint file not found at: {adaface_ckpt_path}")
+            
+            statedict = torch.load(adaface_ckpt_path, map_location=self.device, weights_only=False)['state_dict']
+            model_statedict = {key[6:]: val for key, val in statedict.items() if key.startswith('model.')}
+            self.adaface_model.load_state_dict(model_statedict)
+            self.adaface_model.to(self.device)
+            self.adaface_model.eval()
+            print(f"FaceEmbedder: Loaded AdaFace model ({self.adaface_arch}) from {adaface_ckpt_path} on {self.device}")
         else:
-            if self.rec_model is None:
-                raise RuntimeError("Could not find recognition model in the model pack.")
-            print(f"FaceEmbedder ready | Recognition model: {type(self.rec_model).__name__}")
+            # Full pipeline (detection + recognition) for raw images
+            self.app = FaceAnalysis(name=model_name, providers=providers)
+            self.app.prepare(ctx_id=0, det_size=det_size)
+
+            # Extract the recognition model for direct embedding on cropped faces
+            self.rec_model = self.app.models.get("recognition")
+
+            if self.custom_rec_onnx is not None:
+                import onnxruntime as ort
+                self.custom_sess = ort.InferenceSession(self.custom_rec_onnx, providers=providers)
+                print(f"FaceEmbedder: Loaded custom recognition model from {self.custom_rec_onnx}")
+            else:
+                if self.rec_model is None:
+                    raise RuntimeError("Could not find recognition model in the model pack.")
+                print(f"FaceEmbedder ready | Recognition model: {type(self.rec_model).__name__}")
 
     # -------------------------------------------------------------------------
     # Core methods
@@ -93,8 +133,8 @@ class FaceEmbedder:
 
         results = []
         for face in faces[:max_faces]:
-            if self.custom_rec_onnx is not None:
-                # Custom ONNX alignment & embedding
+            if self.custom_rec_onnx is not None or self.adaface_model is not None:
+                # Custom ONNX or AdaFace PyTorch alignment & embedding
                 aligned_crop = self.align_face(img, face.kps)
                 embedding = self.embed_cropped(aligned_crop)
             else:
@@ -117,7 +157,20 @@ class FaceEmbedder:
         Returns:
             512-d embedding vector (np.ndarray), L2-normalized.
         """
-        if self.custom_rec_onnx is not None:
+        if self.adaface_model is not None:
+            import torch
+            # Preprocess BGR crop for PyTorch AdaFace: resize to 112x112, scale/normalize to [-1, 1], transpose to CHW
+            face_resized = cv2.resize(face_img, (112, 112))
+            face_float = face_resized.astype(np.float32)
+            face_norm = (face_float - 127.5) / 127.5
+            face_input = np.transpose(face_norm, (2, 0, 1))
+            face_batch = np.expand_dims(face_input, axis=0) # shape (1, 3, 112, 112)
+
+            with torch.no_grad():
+                tensor = torch.tensor(face_batch).float().to(self.device)
+                feature, _ = self.adaface_model(tensor)
+                embedding = feature[0].cpu().numpy()
+        elif self.custom_rec_onnx is not None:
             # Preprocess BGR crop: resize, convert to RGB, normalize to [-1, 1], transpose to CHW
             face_resized = cv2.resize(face_img, (112, 112))
             face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)

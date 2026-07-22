@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from face_embedder import FaceEmbedder
 
 # Import configurations from config.py
+
 from config import cfg
+# Đã đọc được tham số dòng lệnh từ khi import cfg rồi !
 
 # Extract configurations
 DATASET_DIR = cfg["dataset"]["dir_path"]
@@ -38,6 +40,9 @@ MODE = cfg["extraction"]["mode"]
 EMBEDDINGS_FILE = cfg["extraction"]["embeddings_file"]
 SPEED_FILE = cfg["extraction"]["speed_file"]
 CUSTOM_REC_ONNX = cfg["extraction"].get("custom_rec_onnx")
+ADAFACE_ARCH = cfg["extraction"].get("adaface_arch")
+ADAFACE_CKPT_PATH = cfg["extraction"].get("adaface_ckpt_path")
+LIMIT_PERSONS = cfg["extraction"].get("limit_persons")
 
 
 def extract_embedding(embedder, img_path: str, mode: str):
@@ -77,6 +82,14 @@ def main():
             providers=PROVIDERS,
             det_size=DET_SIZE,
             custom_rec_onnx=CUSTOM_REC_ONNX,  # Overwrite recognition with our custom ONNX model
+        )
+    elif MODEL_NAME == "adaface":
+        embedder = FaceEmbedder(
+            model_name=MODEL_NAME,
+            providers=PROVIDERS,
+            det_size=DET_SIZE,
+            adaface_arch=ADAFACE_ARCH,
+            adaface_ckpt_path=ADAFACE_CKPT_PATH,
         )
     else:
         embedder = FaceEmbedder(
@@ -129,12 +142,12 @@ def main():
     # Process each identity group
     # Sort keys for deterministic processing order
     sorted_person_ids = sorted(person_groups.groups.keys())
+    if LIMIT_PERSONS:
+        print(f"Limiting to first {LIMIT_PERSONS} persons for testing...")
+        sorted_person_ids = sorted_person_ids[:LIMIT_PERSONS]
 
     for person_id in sorted_person_ids:
         group_df = person_groups.get_group(person_id)
-
-        # Map filename to pre-defined split
-        filename_to_split = dict(zip(group_df["pool_filename"], group_df["split"]))
 
         # Get sorted images
         filenames = sorted(group_df["pool_filename"].tolist())
@@ -149,6 +162,23 @@ def main():
         if not images:
             print(f"  {person_id}: no existing images — skipping")
             continue
+
+        # Map filename to split (dynamic fallback if 'split' column is missing from CSV)
+        if "split" in group_df.columns:
+            filename_to_split = dict(zip(group_df["pool_filename"], group_df["split"]))
+        else:
+            n_imgs = len(images)
+            if n_imgs > GALLERY_COUNT:
+                n_gal = GALLERY_COUNT
+            else:
+                n_gal = min(n_imgs, MIN_GALLERY)
+            
+            filename_to_split = {}
+            for idx, img_path in enumerate(images):
+                if idx < n_gal:
+                    filename_to_split[img_path.name] = "gallery"
+                else:
+                    filename_to_split[img_path.name] = "query"
 
         person_fallbacks = 0
         n_gallery = sum(1 for img in images if filename_to_split[img.name] == "gallery")
