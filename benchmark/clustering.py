@@ -75,6 +75,210 @@ def pairwise_metrics(true_labels, pred_labels):
         
     return precision, recall, f1
 
+def run_infomap(embeddings, k=50, min_sim=0.58):
+    """
+    Runs Infomap face clustering algorithm.
+    Compatible with both Infomap 1.x and Infomap 2.x API versions.
+    
+    :param embeddings: Feature matrix (N, D)
+    :param k: Top-K neighbors for KNN graph
+    :param min_sim: Minimum cosine similarity threshold for edges
+    :return: pred_labels (N,) numpy array
+    """
+    try:
+        import infomap
+    except ImportError:
+        raise ImportError("The 'infomap' package is required to run Infomap clustering. Please install via: pip install infomap")
+
+    emb_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10)
+    emb_norm = emb_norm.astype('float32')
+    N, dim = emb_norm.shape
+
+    try:
+        import faiss
+        index = faiss.IndexFlatIP(dim)
+        index.add(emb_norm)
+        sims, nbrs = index.search(emb_norm, k=min(k, N))
+    except ImportError:
+        sim_matrix = emb_norm @ emb_norm.T
+        nbrs = np.argsort(-sim_matrix, axis=1)[:, :min(k, N)]
+        sims = np.take_along_axis(sim_matrix, nbrs, axis=1)
+
+    singletons = set(range(N))
+    links = {}
+    for i in range(N):
+        for j_idx, sim in zip(nbrs[i], sims[i]):
+            if i == j_idx:
+                continue
+            if sim >= min_sim:
+                links[(i, int(j_idx))] = float(sim)
+                singletons.discard(i)
+                singletons.discard(int(j_idx))
+
+    infomap_wrapper = infomap.Infomap("--two-level --directed")
+    
+    # --- Add links with API version compatibility ---
+    if hasattr(infomap_wrapper, "add_links"):
+        formatted_links = [(int(src), int(dst), float(weight)) for (src, dst), weight in links.items()]
+        infomap_wrapper.add_links(formatted_links)
+    elif hasattr(infomap_wrapper, "add_link"):
+        for (src, dst), weight in links.items():
+            infomap_wrapper.add_link(int(src), int(dst), float(weight))
+    elif hasattr(infomap_wrapper, "addLink"):
+        for (src, dst), weight in links.items():
+            infomap_wrapper.addLink(int(src), int(dst), float(weight))
+    else:
+        raise AttributeError("Infomap object has no attribute 'add_links', 'add_link', or 'addLink'")
+
+    # Run community detection
+    infomap_wrapper.run()
+
+    # --- Extract cluster labels with API version compatibility ---
+    pred_labels = np.full(N, -1, dtype=int)
+    
+    nodes_collection = None
+    if hasattr(infomap_wrapper, "leaves"):
+        nodes_collection = infomap_wrapper.leaves
+    elif hasattr(infomap_wrapper, "nodes"):
+        nodes_collection = infomap_wrapper.nodes
+    elif hasattr(infomap_wrapper, "iterTree"):
+        nodes_collection = infomap_wrapper.iterTree()
+    elif hasattr(infomap_wrapper, "iter_tree"):
+        nodes_collection = infomap_wrapper.iter_tree()
+    else:
+        nodes_collection = infomap_wrapper
+
+    for node in nodes_collection:
+        is_leaf_attr = getattr(node, "is_leaf", getattr(node, "isLeaf", True))
+        is_leaf = is_leaf_attr() if callable(is_leaf_attr) else is_leaf_attr
+        
+        if is_leaf:
+            node_id = getattr(node, "node_id", getattr(node, "physicalId", getattr(node, "id", None)))
+            mod_attr = getattr(node, "module_id", getattr(node, "moduleIndex", None))
+            mod_id = mod_attr() if callable(mod_attr) else mod_attr
+            
+            if node_id is not None and 0 <= node_id < N and mod_id is not None:
+                pred_labels[node_id] = int(mod_id)
+
+    # Assign singletons unique cluster IDs
+    next_cluster_id = pred_labels.max() + 1 if pred_labels.max() >= 0 else 0
+    for node_id in singletons:
+        pred_labels[node_id] = next_cluster_id
+        next_cluster_id += 1
+
+    return pred_labels
+
+
+def post_process_merge_clusters(embeddings: np.ndarray, pred_labels: np.ndarray, merge_sim: float = 0.40, max_small_size: int = 3) -> np.ndarray:
+    """
+    Post-processes clustering output by re-assigning small clusters (size <= max_small_size)
+    to the nearest large cluster using Image-to-Image nearest neighbor matching.
+
+    Strategy: Image-level Nearest Neighbor Re-Assignment
+      1. Separate clusters into 'large' (size > max_small_size) and 'small' (size <= max_small_size).
+      2. Build a FAISS index (or numpy fallback) of ALL images belonging to large clusters.
+      3. For each image in a small cluster, find its nearest neighbor image in the large-cluster index.
+      4. Determine which large cluster the small cluster should join via majority voting.
+      5. Reassign if the best neighbor similarity >= merge_sim.
+
+    :param embeddings: Feature matrix (N, D)
+    :param pred_labels: Initial cluster labels (N,)
+    :param merge_sim: Min cosine similarity (image-to-image) to reassign (e.g. 0.35 to 0.45)
+    :param max_small_size: Maximum cluster size to be considered 'small' and eligible for reassignment
+    :return: post_processed_labels (N,) numpy array
+    """
+    emb_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10)
+    emb_norm = emb_norm.astype('float32')
+    N = len(emb_norm)
+
+    unique_clusters = np.unique(pred_labels)
+    valid_clusters = sorted([c for c in unique_clusters if c >= 0])
+    n_initial_clusters = len(valid_clusters)
+
+    if n_initial_clusters <= 1:
+        return pred_labels.copy()
+
+    # 1. Compute cluster sizes
+    cluster_sizes = {}
+    for c_id in valid_clusters:
+        cluster_sizes[c_id] = int(np.sum(pred_labels == c_id))
+
+    large_clusters = set(c_id for c_id in valid_clusters if cluster_sizes[c_id] > max_small_size)
+    small_clusters = [c_id for c_id in valid_clusters if cluster_sizes[c_id] <= max_small_size]
+
+    if not large_clusters or not small_clusters:
+        print(f"  [Post-Process] No eligible clusters to merge (large={len(large_clusters)}, small={len(small_clusters)})")
+        return pred_labels.copy()
+
+    # 2. Build index of images belonging to large clusters
+    large_mask = np.array([lbl in large_clusters for lbl in pred_labels], dtype=bool)
+    large_indices = np.where(large_mask)[0]
+    large_embeddings = emb_norm[large_indices]
+    large_labels = pred_labels[large_indices]
+
+    try:
+        import faiss
+        dim = large_embeddings.shape[1]
+        index = faiss.IndexFlatIP(dim)
+        index.add(large_embeddings)
+
+        def query_nn(query_embs, k=1):
+            sims, idxs = index.search(query_embs, k)
+            return sims, idxs
+    except ImportError:
+        def query_nn(query_embs, k=1):
+            sim_matrix = query_embs @ large_embeddings.T
+            idxs = np.argsort(-sim_matrix, axis=1)[:, :k]
+            sims = np.take_along_axis(sim_matrix, idxs, axis=1)
+            return sims, idxs
+
+    # 3. For each small cluster, find nearest large cluster via image-level NN
+    reassign_map = {}
+    n_reassigned = 0
+    n_kept = 0
+
+    for s_id in small_clusters:
+        s_mask = (pred_labels == s_id)
+        s_indices = np.where(s_mask)[0]
+        s_embeddings = emb_norm[s_indices]
+
+        # Find nearest neighbor in large clusters for each image in the small cluster
+        sims, nn_idxs = query_nn(s_embeddings, k=1)
+        sims = sims.flatten()
+        nn_idxs = nn_idxs.flatten()
+
+        # Get the large cluster label for each nearest neighbor
+        nn_large_labels = large_labels[nn_idxs]
+
+        # Majority vote: which large cluster do most images point to?
+        nn_unique, nn_counts = np.unique(nn_large_labels, return_counts=True)
+        best_large_id = nn_unique[np.argmax(nn_counts)]
+
+        # Check similarity: use the max similarity among images pointing to the best large cluster
+        best_mask = (nn_large_labels == best_large_id)
+        best_sim = float(np.max(sims[best_mask]))
+
+        if best_sim >= merge_sim:
+            reassign_map[s_id] = int(best_large_id)
+            n_reassigned += 1
+        else:
+            n_kept += 1
+
+    # 4. Apply reassignment
+    post_processed_labels = pred_labels.copy()
+    for old_id, new_id in reassign_map.items():
+        post_processed_labels[pred_labels == old_id] = new_id
+
+    n_final_clusters = len(np.unique(post_processed_labels[post_processed_labels >= 0]))
+    print(f"  [Post-Process] Image-level NN Re-Assignment (merge_sim={merge_sim:.2f}, max_small_size={max_small_size}):")
+    print(f"    - Large clusters (>{max_small_size} imgs): {len(large_clusters)}")
+    print(f"    - Small clusters (≤{max_small_size} imgs): {len(small_clusters)}")
+    print(f"    - Reassigned to large: {n_reassigned} | Kept as-is: {n_kept}")
+    print(f"    - Result: {n_initial_clusters} initial clusters --> {n_final_clusters} final clusters")
+
+    return post_processed_labels
+
+
 class ClusteringEvaluator:
     def __init__(self, embeddings, true_labels):
         self.embeddings = embeddings
@@ -206,10 +410,25 @@ class ClusteringEvaluator:
                         all_results.append(self._evaluate_run("Agglomerative", params, labels))
                     except Exception as e:
                         print(f"    Error running Agglomerative with {params}: {e}")
+
+            elif name == "infomap":
+                grid = {
+                    "k": alg_cfg.get("k", [50]),
+                    "min_sim": alg_cfg.get("min_sim", [0.58])
+                }
+                keys, values = zip(*grid.items())
+                for combination in itertools.product(*values):
+                    params = dict(zip(keys, combination))
+                    try:
+                        labels = run_infomap(self.embeddings, k=params["k"], min_sim=params["min_sim"])
+                        all_results.append(self._evaluate_run("Infomap", params, labels))
+                    except Exception as e:
+                        print(f"    Error running Infomap with {params}: {e}")
                         
         # Sort results by BCubed F1 score descending
         all_results = sorted(all_results, key=lambda x: x["bcubed_f1"], reverse=True)
         return all_results
+
         
     def _evaluate_run(self, algo_name, params, pred_labels):
         """Computes all metrics for a single clustering run."""

@@ -76,6 +76,13 @@ clustering:
       linkage: ["average", "complete", "single"]
       metric: ["cosine", "euclidean"]
 
+    infomap:
+      enabled: true
+      k: [30, 50, 80]
+      min_sim: [0.35, 0.40, 0.45, 0.50, 0.55, 0.58]
+
+
+
 # Visualization and plotting options
 evaluation:
   tsne_perplexity: 30
