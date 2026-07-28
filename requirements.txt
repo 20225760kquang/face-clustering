@@ -7,3 +7,8 @@ scikit-learn
 pyyaml
 umap-learn
 pandas
+torch
+infomap
+python-igraph
+leidenalg
+faiss-cpu
